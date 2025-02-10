@@ -1,0 +1,186 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from xml.etree import ElementTree as ET
+from io import StringIO
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Fetch EUR/KRW exchange rate data from ECB XML
+def fetch_eur_krw_from_ecb_xml():
+    url = "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/krw.xml"
+    try:
+        response = requests.get(url, verify=False)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print("HTTP 요청 중 문제가 발생했습니다:", e)
+        raise
+
+    root = ET.fromstring(response.content)
+    namespace = {"ns": "http://www.ecb.europa.eu/vocabulary/stats/exr/1"}
+
+    observations = root.findall(".//ns:Obs", namespace)
+    if not observations:
+        raise ValueError("XML 데이터에서 <Obs> 태그를 찾을 수 없습니다.")
+
+    eur_krw_data = []  # Renamed from 'data' for clarity
+    for obs in observations:
+        date = obs.get("TIME_PERIOD")
+        rate = obs.get("OBS_VALUE")
+        if date and rate:
+            eur_krw_data.append([date, float(rate)])
+
+    eur_krw_df = pd.DataFrame(eur_krw_data, columns=["Date", "EUR/KRW"])  # Avoid generic 'df'
+    eur_krw_df["Date"] = pd.to_datetime(eur_krw_df["Date"], format="%Y-%m-%d")
+    eur_krw_df.set_index("Date", inplace=True)
+    return eur_krw_df
+
+# Fetch Federal Reserve data
+def fetch_fed_rate():
+    csv_url = "https://www.federalreserve.gov/aboutthefed/files/target-funds-2014-2024.csv"
+    try:
+        response = requests.get(csv_url, verify=False)
+        response.raise_for_status()
+        csv_data = StringIO(response.text)
+        fed_rate_data = pd.read_csv(csv_data)  # Renamed from 'df' to avoid conflict
+        latest_date = fed_rate_data.columns[-1]
+        low_rate = fed_rate_data.loc[0, latest_date]
+        high_rate = fed_rate_data.loc[1, latest_date]
+        fed_rate = (low_rate + high_rate) / 2
+        return fed_rate
+    except Exception as e:
+        print(f"Error fetching Fed rate: {e}")
+        return None
+
+
+# Fetch Bank of Korea data
+def fetch_bok_rate():
+    url_bok = "https://www.bok.or.kr/portal/singl/baseRate/list.do?dataSeCd=01&menuNo=200643"
+    try:
+        response_bok = requests.get(url_bok, verify=False)
+        response_bok.raise_for_status()
+        soup_bok = BeautifulSoup(response_bok.text, 'html.parser')
+        table_bok = soup_bok.find('table', class_='fixed')
+        latest_row_bok = table_bok.find_all('tr')[1]
+        cols_bok = latest_row_bok.find_all('td')
+        bok_rate = float(cols_bok[2].text.strip())
+        return bok_rate
+    except Exception as e:
+        print(f"Error fetching BOK rate: {e}")
+        return None
+
+# Fetch ECB rate data
+def fetch_ecb_rate():
+    url_ecb = "https://data.ecb.europa.eu/data-detail-transform/FM.D.U2.EUR.4F.KR.MRR_FR.LEV/143"
+    try:
+        response_ecb = requests.get(url_ecb, verify=False)
+        response_ecb.raise_for_status()
+        data_ecb = response_ecb.json()
+        observation = data_ecb[0]["observationList"][0]
+        ecb_rate = float(observation["obsValue"])
+        return ecb_rate
+    except Exception as e:
+        print(f"Error fetching ECB rate: {e}")
+        return None
+
+# Calculate today’s EUR/KRW rate
+def calculate_today_eur_krw(usd_eur, usd_krw):
+    return usd_krw / usd_eur
+
+# IRP-adjusted EUR/KRW
+def calculate_irp_eur_krw(usd_eur, usd_krw, fed_rate, bok_rate, ecb_rate):
+    usd_krw_irp = usd_krw * (1 + (bok_rate / 100)) / (1 + (fed_rate / 100))
+    eur_krw_irp = usd_krw_irp / usd_eur
+    return eur_krw_irp
+
+# Calculate EUR/KRW from USD/EUR and USD/KRW
+def calculate_today_eur_krw(usd_eur, usd_krw):
+    return usd_krw / usd_eur
+
+# Calculate IRP-adjusted EUR/KRW
+def calculate_irp_eur_krw(fed_rate, bok_rate, ecb_rate, usd_eur, usd_krw):
+    eur_krw = usd_krw / usd_eur
+    irp_adjustment = (1 + ecb_rate / 100) / (1 + bok_rate / 100)
+    return eur_krw * irp_adjustment
+
+# Analyze trends and moving averages
+def analyze_trend_and_bounds(data):
+    data["MA5"] = data["EUR/KRW"].rolling(window=5).mean()
+    data["MA20"] = data["EUR/KRW"].rolling(window=20).mean()
+    data["MA60"] = data["EUR/KRW"].rolling(window=60).mean()
+    recent_data = data[-60:]
+    lower_support = recent_data["EUR/KRW"].min()
+    upper_resistance = recent_data["EUR/KRW"].max()
+
+    recent_rate = data["EUR/KRW"].iloc[-1]
+    ma5 = data["MA5"].iloc[-1]
+    ma20 = data["MA20"].iloc[-1]
+    ma60 = data["MA60"].iloc[-1]
+
+    if recent_rate < ma5 and recent_rate < ma20 and recent_rate < ma60:
+        trend = "하락 추세"
+    elif recent_rate > ma5 and recent_rate > ma20:
+        trend = "상승 추세"
+    else:
+        trend = "조정 국면"
+
+    print(f"이동평균선 (5일): {ma5:.2f}")
+    print(f"이동평균선 (20일): {ma20:.2f}")
+    print(f"이동평균선 (60일): {ma60:.2f}")
+
+    return trend, lower_support, upper_resistance
+
+# Calculate spread
+def calculate_spread(today_eur_krw, lower_support, upper_resistance):
+    spread_lower = max(lower_support, today_eur_krw * 0.998)
+    spread_upper = min(upper_resistance, today_eur_krw * 1.002)
+    return spread_lower, spread_upper
+
+
+def main():
+    # Fetch rates
+    fed_rate = fetch_fed_rate()
+    bok_rate = fetch_bok_rate()
+    ecb_rate = fetch_ecb_rate()
+    
+    if None in (fed_rate, bok_rate, ecb_rate):
+        print("필요한 기준금리 데이터를 확인할 수 없습니다. Fetch하는 경로를 점검하세요.")
+        return
+
+    print(f"Fed Rate: {fed_rate:.2f}%, BOK Rate: {bok_rate:.2f}%, ECB Rate: {ecb_rate:.2f}%")
+
+    try:
+        usd_eur = float(input("현재 USD/EUR 환율을 입력하세요: "))
+        usd_krw = float(input("현재 USD/KRW 환율을 입력하세요: "))
+    except ValueError:
+        print("환율 입력값이 유효하지 않습니다. 숫자를 입력하세요.")
+        return
+
+    # Fetch historical EUR/KRW data
+    try:
+        eur_krw_data = fetch_eur_krw_from_ecb_xml()
+    except Exception as e:
+        print(f"Error fetching EUR/KRW data: {e}")
+        return
+
+    # Calculate exchange rates
+    today_eur_krw_unadjusted = calculate_today_eur_krw(usd_eur, usd_krw)
+    today_eur_krw_adjusted = calculate_irp_eur_krw(fed_rate, bok_rate, ecb_rate, usd_eur, usd_krw)
+
+    # Analyze trends and calculate bounds
+    trend, lower_support, upper_resistance = analyze_trend_and_bounds(eur_krw_data)
+    spread_lower, spread_upper = calculate_spread(today_eur_krw_unadjusted, lower_support, upper_resistance) #일일 스프레드가 20bp 이상일 때는 유효하지 않으므로 today_eur_krw_unadjusted에서 적용할 것
+
+    print("\n--- 분석 완료 ---")
+    print(f"\n오늘 계산된 EUR/KRW 적정가 (IRP 조정 전): {today_eur_krw_unadjusted:.2f}")
+    print(f"오늘 계산된 EUR/KRW 적정가 (IRP 조정 후): {today_eur_krw_adjusted:.2f}")
+    print(f"현재 추세: {trend}")
+    print(f"하방저지선: {lower_support:.2f}, 상방저지선: {upper_resistance:.2f}")
+    print(f"스프레드 (±10bp 변동): {today_eur_krw_unadjusted * 0.999:.2f} ~ {today_eur_krw_unadjusted * 1.001:.2f}")
+    print(f"스프레드 (±20bp 변동): {today_eur_krw_unadjusted * 0.998:.2f} ~ {today_eur_krw_unadjusted * 1.002:.2f}")
+
+if __name__ == "__main__":
+    main()
